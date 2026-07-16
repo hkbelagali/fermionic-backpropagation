@@ -28,11 +28,15 @@ alpha_alpha_indices = lambda norb: None  # Use lambda norb: [(p, p + 1) for p in
 alpha_beta_indices  = lambda norb: None  # Use lambda norb: [(p, p) for p in range(0, norb, 4) if p <= 16] for a (truncated) LUCJ circuit.
 
 # Variational optimization settings. See fermiprop/propagator.py's
-# optimize_jax() docstring: chunk_size must evenly divide num_orb**4;
-# num_orb**2 is always a safe, valid choice.
+# optimize_jax() docstring: chunk_size must evenly divide num_orb**4.
+# None means unchunked (single batch, no jax.checkpoint recompute overhead) --
+# fine for this active space's size on a GPU with tens of GB free. If running
+# on a memory-constrained machine (e.g. CPU-only), set this to num_orb**2
+# instead, which bounds memory at the cost of some recompute during the
+# backward pass.
 optimizer_method = "L-BFGS-B"
 optimizer_options = {"maxiter": 500, "gtol": 1e-9, "ftol": 1e-9}
-optimizer_chunk_size = None  # set below to num_orb**2 once num_orb is known
+optimizer_chunk_size = None
 
 # Each bond-distance subdirectory has its own pre-generated FCIDUMP (active
 # space integrals for this R), matching the 4Fe-4S workflow.
@@ -70,9 +74,6 @@ print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
 # print("CCSD total energy:", ccsd.e_tot)
 # print("CISD correlation energy:", ecisd)
 # print("CISD total energy:", cisd.e_tot)
-
-if optimizer_chunk_size is None:
-    optimizer_chunk_size = num_orb ** 2
 
 nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
 
