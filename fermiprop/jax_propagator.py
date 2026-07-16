@@ -149,7 +149,13 @@ def _compute_energy_jax(Q, ecore, h_bp, g_bp, A, L, norb, chunk_size=None):
         if n4 % chunk_size != 0:
             raise ValueError(f"chunk_size ({chunk_size}) must evenly divide norb**4 ({n4}).")
         idx_chunks = jnp.arange(n4).reshape(-1, chunk_size)
-        E2 = jnp.sum(jax.lax.map(two_body_chunk, idx_chunks))
+        # jax.checkpoint (rematerialization) is essential here: without it,
+        # lax.map's reverse-mode AD stores every chunk's intermediate
+        # activations for the backward pass, so total memory ends up
+        # O(n_chunks * chunk_size) -- no better than not chunking at all.
+        # With it, each chunk's forward pass is recomputed during the
+        # backward pass instead, bounding memory to O(chunk_size).
+        E2 = jnp.sum(jax.lax.map(jax.checkpoint(two_body_chunk), idx_chunks))
 
     E = ecore + E1 + E2
     return jnp.real(E)
