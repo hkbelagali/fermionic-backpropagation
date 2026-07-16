@@ -29,14 +29,16 @@ alpha_beta_indices  = lambda norb: None  # Use lambda norb: [(p, p) for p in ran
 
 # Variational optimization settings. See fermiprop/propagator.py's
 # optimize_jax() docstring: chunk_size must evenly divide num_orb**4.
-# None means unchunked (single batch, no jax.checkpoint recompute overhead) --
-# fine for this active space's size on a GPU with tens of GB free. If running
-# on a memory-constrained machine (e.g. CPU-only), set this to num_orb**2
-# instead, which bounds memory at the cost of some recompute during the
-# backward pass.
+# None (fully unchunked) needs ~48GB for this active space -- fine on an
+# H200 (143GB) but OOMs on a 32GB V100, and cluster jobs here can land on
+# either, so default to something that fits comfortably on the smallest
+# GPU in rotation. num_orb**3 (~26 chunks, ~1-2GB/chunk by linear
+# extrapolation from the 48GB/1-chunk figure) leaves plenty of headroom on
+# a 32GB card; drop to num_orb**2 (~676 chunks) if that's still too much,
+# or raise towards num_orb**4 (i.e. None) if you know you're on an H200.
 optimizer_method = "L-BFGS-B"
 optimizer_options = {"maxiter": 500, "gtol": 1e-9, "ftol": 1e-9}
-optimizer_chunk_size = None
+optimizer_chunk_size = None  # set below to num_orb**3 once num_orb is known
 
 # Each bond-distance subdirectory has its own pre-generated FCIDUMP (active
 # space integrals for this R), matching the 4Fe-4S workflow.
@@ -66,9 +68,13 @@ n_qubits = 2 * num_orb
 h2e = pyscf.ao2mo.restore(1, mf._eri, num_orb)
 nelec = pyscf.tools.fcidump.read(fcidump_filename)["NELEC"]
 
+if optimizer_chunk_size is None:
+    optimizer_chunk_size = num_orb ** 3
+
 print(f"Bond distance: {bond_distance} Angstrom")
 print(f"FCIDUMP: {fcidump_filename}")
 print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
+print(f"optimize_jax chunk_size: {optimizer_chunk_size}")
 # print("Hartree-Fock energy:", mf.e_tot)
 # print("CCSD correlation energy:", eccsd)
 # print("CCSD total energy:", ccsd.e_tot)
