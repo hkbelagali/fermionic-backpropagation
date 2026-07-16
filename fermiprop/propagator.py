@@ -5,8 +5,12 @@ import scipy.optimize
 
 import pyscf
 import ffsim
+import jax
+import jax.numpy as jnp
 
 from tqdm import tqdm
+
+from .jax_propagator import energy_and_grad_jax
 
 class UCJBackPropagator: 
     """Numerical backpropagator for the UCJ ansatz.""" 
@@ -62,6 +66,7 @@ class UCJBackPropagator:
         self,
         x0: np.typing.NDArray | None = None,
         interaction_pairs: tuple[list[tuple[int, int]] | None, list[tuple[int, int]] | None] | None = None,
+        show_progress: bool = True,
         **minimize_options,
     ) -> scipy.optimize.OptimizeResult:
         """
@@ -76,6 +81,11 @@ class UCJBackPropagator:
             interaction_pairs: Restrictions on allowed orbital interactions for
                 the diagonal Coulomb operators, forwarded to `to_parameters`/
                 `from_parameters`. Must match how `x0` was generated, if given.
+            show_progress: Whether to display a tqdm progress bar tracking the
+                energy at each optimizer step. If a `callback` is also passed
+                in `**minimize_options`, it is called after the progress bar
+                updates on each step (it must accept scipy's modern
+                `callback(intermediate_result)` signature).
             **minimize_options: Additional keyword arguments forwarded to
                 `scipy.optimize.minimize` (e.g. `method`, `options`, `tol`,
                 `bounds`, `callback`).
@@ -102,7 +112,122 @@ class UCJBackPropagator:
             )
             return self._energy(ucj, show_progress=False)
 
-        result = scipy.optimize.minimize(cost, x0, **minimize_options)
+        user_callback = minimize_options.pop("callback", None)
+        pbar = None
+        if show_progress:
+            maxiter = (minimize_options.get("options") or {}).get("maxiter")
+            pbar = tqdm(total=maxiter, desc="optimize", unit="step")
+
+            def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+                pbar.update(1)
+                pbar.set_postfix(energy=f"{intermediate_result.fun:.8f}")
+                if user_callback is not None:
+                    user_callback(intermediate_result)
+
+            minimize_options["callback"] = callback
+        elif user_callback is not None:
+            minimize_options["callback"] = user_callback
+
+        try:
+            result = scipy.optimize.minimize(cost, x0, **minimize_options)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        self.op = ffsim.UCJOpSpinBalanced.from_parameters(
+            result.x,
+            norb=norb,
+            n_reps=n_reps,
+            interaction_pairs=interaction_pairs,
+            with_final_orbital_rotation=with_final_orbital_rotation,
+        )
+        self.W = self.op.orbital_rotations[0]
+        self.u = self.W if self.op.final_orbital_rotation is None else self.op.final_orbital_rotation @ self.W
+
+        return result
+
+    def optimize_jax(
+        self,
+        x0: np.typing.NDArray | None = None,
+        interaction_pairs: tuple[list[tuple[int, int]] | None, list[tuple[int, int]] | None] | None = None,
+        chunk_size: int | None = None,
+        show_progress: bool = True,
+        **minimize_options,
+    ) -> scipy.optimize.OptimizeResult:
+        """
+        Variationally optimize the UCJ circuit parameters using analytic
+        gradients.
+
+        Args:
+            x0: Initial guess for the circuit parameters, in the real-valued
+                parameterization produced by `UCJOpSpinBalanced.to_parameters`.
+                Defaults to the parameters of the operator this backpropagator
+                was constructed with.
+            interaction_pairs: Restrictions on allowed orbital interactions for
+                the diagonal Coulomb operators, forwarded to `to_parameters`/
+                `from_parameters`. Must match how `x0` was generated, if given.
+            chunk_size: Optionally bounds memory by processing the two-body
+                `norb**4` sum via `jax.lax.map` in chunks of this size
+                (must evenly divide `norb**4`) instead of a single batch.
+                Defaults to no chunking, which is fine for small systems but
+                can be memory-prohibitive at real active-space sizes.
+            show_progress: Whether to display a tqdm progress bar tracking the
+                energy at each optimizer step. If a `callback` is also passed
+                in `**minimize_options`, it is called after the progress bar
+                updates on each step (it must accept scipy's modern
+                `callback(intermediate_result)` signature).
+            **minimize_options: Additional keyword arguments forwarded to
+                `scipy.optimize.minimize` (e.g. `method`, `options`, `tol`,
+                `bounds`, `callback`). `jac` is always set to `True` internally,
+                since the objective already returns `(energy, gradient)`.
+
+        Returns:
+            The `scipy.optimize.OptimizeResult` from the minimization. On
+            return, `self.op` (and `self.W`/`self.u`) are updated to the
+            optimized operator, so a subsequent call to `propagate()` reflects
+            the optimized energy.
+        """
+        n_reps, _, norb, _ = self.op.diag_coulomb_mats.shape
+        with_final_orbital_rotation = self.op.final_orbital_rotation is not None
+
+        if x0 is None:
+            x0 = self.op.to_parameters(interaction_pairs=interaction_pairs)
+
+        h1e_j = jnp.array(self.h1e)
+        h2e_j = jnp.array(self.h2e)
+
+        value_and_grad_fn = jax.jit(
+            lambda params: energy_and_grad_jax(
+                params, h1e_j, h2e_j, self.ecore, self.nelec, norb, n_reps,
+                interaction_pairs, with_final_orbital_rotation, chunk_size,
+            )
+        )
+
+        def cost(params: np.typing.NDArray):
+            energy, grad = value_and_grad_fn(jnp.array(params))
+            return float(energy), np.asarray(grad)
+
+        user_callback = minimize_options.pop("callback", None)
+        pbar = None
+        if show_progress:
+            maxiter = (minimize_options.get("options") or {}).get("maxiter")
+            pbar = tqdm(total=maxiter, desc="optimize_jax", unit="step")
+
+            def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+                pbar.update(1)
+                pbar.set_postfix(energy=f"{intermediate_result.fun:.8f}")
+                if user_callback is not None:
+                    user_callback(intermediate_result)
+
+            minimize_options["callback"] = callback
+        elif user_callback is not None:
+            minimize_options["callback"] = user_callback
+
+        try:
+            result = scipy.optimize.minimize(cost, x0, jac=True, **minimize_options)
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         self.op = ffsim.UCJOpSpinBalanced.from_parameters(
             result.x,
@@ -203,20 +328,8 @@ def _compute_energy(
     round_decimals: int = 10,
     show_progress: bool = True,
 ) -> float:
-    """Returns the energy E = ecore + sum h_bp . gamma + 1/2 g_bp . Gamma,
-    evaluated exactly on the Slater determinant |Q> using generalized Wick-
-    Löwdin rules for matrix elements of a monomial times a Gaussian phase.
-
-    The two-body sum ranges over norb**4 index tuples (p,q,r,s), but each
-    term only needs the phase-rotated transition amplitude at one of a much
-    smaller set of distinct phi vectors (duplicates arise from index
-    symmetries and shared Jastrow structure -- for the 36-orbital Fe4S4
-    active space this is a ~58x reduction). Rather than a per-tuple Python
-    loop with a dict cache, this dedupes all norb**4 tuples up front and
-    runs the determinant/inverse (transition_batch) as batched numpy linalg
-    over just the unique vectors, streaming through them in gid_batch-sized
-    chunks so the full (n_unique, norb, norb) transition-matrix cache is
-    never materialized at once.
+    """
+    Returns the energy.
 
     Args:
     Q: (norb x n_occ) Occupied-orbital matrix of e^{-K}|HF>, one spin
@@ -268,8 +381,6 @@ def _compute_energy(
     g_flat = g_bp.reshape(-1)
     p_all, q_all, r_all, s_all = np.unravel_index(np.arange(n4), (norb, norb, norb, norb))
 
-    # Phase 1: dedup the phi vectors needed by every (p,q,r,s) tuple, across
-    # both the same-spin and opposite-spin branches (4 phi vectors/tuple).
     unique_phis = []
     key_to_gid = {}
 
@@ -312,8 +423,6 @@ def _compute_energy(
     unique_phis = np.array(unique_phis)
     n_unique = unique_phis.shape[0]
 
-    # Phase 2: the Gaussian-phase prefactor for each tuple is cheap (no
-    # linalg) so it's just recomputed directly, without deduping.
     const_same_arr = np.empty(n4, dtype=np.complex128)
     const_opp_arr = np.empty(n4, dtype=np.complex128)
     for start in range(0, n4, tuple_chunk):
@@ -334,10 +443,6 @@ def _compute_energy(
             + (L[p] - L[q] + L[norb + r] - L[norb + s])
         ))
 
-    # Phase 3: stream through unique phi vectors in batches, computing
-    # transition_batch once per batch and immediately harvesting the
-    # specific scalar entries each tuple needs, rather than materializing
-    # the full (n_unique, norb, norb) transition-matrix cache at once.
     det_a_same_arr = np.empty(n4, dtype=np.complex128)
     rho_a_same_qp = np.empty(n4, dtype=np.complex128)
     rho_a_same_sr = np.empty(n4, dtype=np.complex128)

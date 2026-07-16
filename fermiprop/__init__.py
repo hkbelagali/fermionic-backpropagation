@@ -1,1 +1,1 @@
-from propagator import UCJBackPropagator
+from .propagator import UCJBackPropagator
