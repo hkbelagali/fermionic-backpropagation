@@ -16,8 +16,8 @@ from fermiprop import UCJBackPropagator
 
 # Molecule parameters.
 atom = "H"
-natoms = 2
-atomic_distance = 0.74  # Angstrom.
+natoms = 40
+atomic_distance = 1.00  # Angstrom.
 
 # Parameters of the (L)UCJ ansatz.
 half_layer = False                       # If True, appends a final rotation to the circuit, but makes the energy worse.
@@ -27,7 +27,7 @@ alpha_beta_indices  = lambda norb: None  # Use lambda norb: [(p, p) for p in ran
 # Variational optimization settings. See fermiprop/propagator.py's
 # optimize_jax() docstring: chunk_size must evenly divide num_orb**4.
 optimizer_method = "L-BFGS-B"
-optimizer_options = {"maxiter": 500, "gtol": 1e-9, "ftol": 1e-9}
+optimizer_options = {"maxiter": 10000, "gtol": 1e-9, "ftol": 1e-9}
 optimizer_chunk_size = None  # set below to num_orb**4 (i.e. unchunked) once num_orb is known -- H2 is tiny.
 
 
@@ -61,7 +61,7 @@ h2e = pyscf.ao2mo.restore(1, mol_data.two_body_integrals, num_orb)
 constant = mol_data.core_energy
 
 if optimizer_chunk_size is None:
-    optimizer_chunk_size = num_orb ** 4
+    optimizer_chunk_size = num_orb ** 3
 
 print(f"Atomic distance: {atomic_distance} Angstrom")
 print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
@@ -117,8 +117,10 @@ print(f"Variationally optimized UCJ energy: {ucj_optimized_energy:.10f} Ha")
 print(f"Backpropagation (CCSD-parameterized) runtime: {propagate_runtime:.4f} s")
 print(f"Variational optimization runtime: {optimize_runtime:.4f} s")
 
+os.makedirs(f"n{natoms}", exist_ok=True)
+
 np.savez(
-    "UCJ_results.npz",
+    f"n{natoms}/UCJ_results.npz",
     atomic_distance=atomic_distance,
     hf_energy=scf.e_tot,
     ccsd_energy=ccsd.e_tot,
