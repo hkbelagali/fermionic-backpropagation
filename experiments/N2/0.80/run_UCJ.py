@@ -44,21 +44,36 @@ optimizer_chunk_size = None  # set below to num_orb**3 once num_orb is known
 # space integrals for this R), matching the 4Fe-4S workflow.
 [fcidump_filename] = glob.glob("*_fcidump.txt")
 
-# Run Hartree-Fock.
+# Run Hartree-Fock. N2 dissociation curves are a known hard case for RHF
+# convergence (near-degenerate/symmetry-breaking orbitals as the bond
+# stretches), so start with damping + level-shifting for stability, and
+# only escalate to the second-order (Newton) SCF solver if that alone
+# isn't enough.
 mf = pyscf.tools.fcidump.to_scf(fcidump_filename)
-mf.max_cycle = 100
+mf.max_cycle = 300
 mf.conv_tol = 1e-9
-mf = mf.newton()
+mf.level_shift = 0.3
+mf.damp = 0.3
 mf.kernel()
+if not mf.converged:
+    mf = mf.newton()
+    mf.max_cycle = 200
+    mf.kernel()
 assert mf.converged, "SCF did not converge"
 
-# Run CCSD.
+# Run CCSD. Default max_cycle=50 isn't always enough at stretched bond
+# lengths (confirmed: R=3.00 needs ~more than 50 iterations here, converges
+# fine with more room).
 ccsd = pyscf.cc.CCSD(mf)
+ccsd.max_cycle = 200
 eccsd, *_ = ccsd.kernel()
+assert ccsd.converged, "CCSD did not converge"
 
 # Run CISD.
 cisd = pyscf.ci.CISD(mf)
+cisd.max_cycle = 200
 ecisd, *_ = cisd.kernel()
+assert cisd.converged, "CISD did not converge"
 
 # Extract second-quantized Hamiltonian and Hamiltonian parameters.
 constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
@@ -83,48 +98,4 @@ print(f"optimize_jax chunk_size: {optimizer_chunk_size}")
 
 nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
 
-# Build the UCJ Operation.
-base_op = ffsim.UCJOpSpinBalanced.from_t_amplitudes(
-    t2=ccsd.t2, n_reps=1,  # The polynomial time algorithm applies to one repetition/layer of the UCJ ansatz.
-    interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
-)
-if half_layer:
-    ucj_op = ffsim.UCJOpSpinBalanced(
-        diag_coulomb_mats=base_op.diag_coulomb_mats[:1],
-        orbital_rotations=base_op.orbital_rotations[:1],
-        final_orbital_rotation=base_op.orbital_rotations[1].conj().T,
-    )
-else:
-    ucj_op = base_op
-
-backprop = UCJBackPropagator(ucj_op, nelec=nelec, num_orb=num_orb, h1e=h1e, h2e=h2e, ecore=constant)
-
-# CCSD-parameterized UCJ energy, before variational optimization.
-ucj_ccsd_energy = backprop.propagate()
-
-# Variationally optimize the circuit parameters starting from the
-# CCSD-derived parameters, using analytic (JAX autodiff) gradients.
-result = backprop.optimize_jax(
-    interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
-    chunk_size=optimizer_chunk_size,
-    method=optimizer_method,
-    options=optimizer_options,
-)
-ucj_optimized_energy = backprop.propagate(show_progress=False)
-
-print(f"Hartree-Fock energy: {mf.e_tot:.10f} Ha")
-print(f"CCSD energy: {ccsd.e_tot:.10f} Ha")
-print(f"CISD energy: {cisd.e_tot:.10f} Ha")
-print(f"CCSD-parameterized UCJ energy: {ucj_ccsd_energy:.10f} Ha")
-print(f"Variationally optimized UCJ energy: {ucj_optimized_energy:.10f} Ha")
-
-np.savez(
-    "UCJ_results.npz",
-    bond_distance=bond_distance,
-    hf_energy=mf.e_tot,
-    ccsd_energy=ccsd.e_tot,
-    cisd_energy=cisd.e_tot,
-    ucj_ccsd_energy=ucj_ccsd_energy,
-    ucj_optimized_energy=ucj_optimized_energy,
-)
-print("Saved results to UCJ_results.npz")
+# Build the UCJ Operation. half_layer needs a second repetition's worth of

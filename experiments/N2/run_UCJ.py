@@ -44,21 +44,36 @@ optimizer_chunk_size = None  # set below to num_orb**3 once num_orb is known
 # space integrals for this R), matching the 4Fe-4S workflow.
 [fcidump_filename] = glob.glob("*_fcidump.txt")
 
-# Run Hartree-Fock.
+# Run Hartree-Fock. N2 dissociation curves are a known hard case for RHF
+# convergence (near-degenerate/symmetry-breaking orbitals as the bond
+# stretches), so start with damping + level-shifting for stability, and
+# only escalate to the second-order (Newton) SCF solver if that alone
+# isn't enough.
 mf = pyscf.tools.fcidump.to_scf(fcidump_filename)
-mf.max_cycle = 100
+mf.max_cycle = 300
 mf.conv_tol = 1e-9
-mf = mf.newton()
+mf.level_shift = 0.3
+mf.damp = 0.3
 mf.kernel()
+if not mf.converged:
+    mf = mf.newton()
+    mf.max_cycle = 200
+    mf.kernel()
 assert mf.converged, "SCF did not converge"
 
-# Run CCSD.
+# Run CCSD. Default max_cycle=50 isn't always enough at stretched bond
+# lengths (confirmed: R=3.00 needs ~more than 50 iterations here, converges
+# fine with more room).
 ccsd = pyscf.cc.CCSD(mf)
+ccsd.max_cycle = 200
 eccsd, *_ = ccsd.kernel()
+assert ccsd.converged, "CCSD did not converge"
 
 # Run CISD.
 cisd = pyscf.ci.CISD(mf)
+cisd.max_cycle = 200
 ecisd, *_ = cisd.kernel()
+assert cisd.converged, "CISD did not converge"
 
 # Extract second-quantized Hamiltonian and Hamiltonian parameters.
 constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
@@ -83,9 +98,13 @@ print(f"optimize_jax chunk_size: {optimizer_chunk_size}")
 
 nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
 
-# Build the UCJ Operation.
+# Build the UCJ Operation. half_layer needs a second repetition's worth of
+# orbital rotations to promote into a final_orbital_rotation (n_reps=1 --
+# required by the polynomial-time energy algorithm's single-layer assumption
+# -- only ever returns one), so ask for n_reps=2 in that case and keep only
+# the first layer's diag_coulomb_mats/orbital_rotation as the actual ansatz.
 base_op = ffsim.UCJOpSpinBalanced.from_t_amplitudes(
-    t2=ccsd.t2, n_reps=1,  # The polynomial time algorithm applies to one repetition/layer of the UCJ ansatz.
+    t2=ccsd.t2, n_reps=(2 if half_layer else 1),
     interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
 )
 if half_layer:

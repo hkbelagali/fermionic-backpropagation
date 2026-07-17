@@ -22,11 +22,20 @@ bond_distance = 1.30  # Angstrom; substituted by launch.sh from the subdirectory
 # Same pre-generated FCIDUMP that run_UCJ.py uses, so the Hamiltonians match.
 [fcidump_filename] = glob.glob("*_fcidump.txt")
 
+# N2 dissociation curves are a known hard case for RHF convergence
+# (near-degenerate/symmetry-breaking orbitals as the bond stretches), so
+# start with damping + level-shifting for stability, and only escalate to
+# the second-order (Newton) SCF solver if that alone isn't enough.
 mf = pyscf.tools.fcidump.to_scf(fcidump_filename)
-mf.max_cycle = 100
+mf.max_cycle = 300
 mf.conv_tol = 1e-9
-mf = mf.newton()
+mf.level_shift = 0.3
+mf.damp = 0.3
 mf.kernel()
+if not mf.converged:
+    mf = mf.newton()
+    mf.max_cycle = 200
+    mf.kernel()
 assert mf.converged, "SCF did not converge"
 
 # Extract second-quantized Hamiltonian parameters -- same convention as run_UCJ.py.
