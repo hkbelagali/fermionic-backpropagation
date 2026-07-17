@@ -9,30 +9,32 @@ directory's value before running. Molecule/basis settings must match
 run_UCJ.py's for the energies to be comparable.
 """
 
+import glob
+
 import numpy as np
 import pyscf
+import pyscf.tools.fcidump
 from pyscf.fci import selected_ci
 
 # Molecule parameters -- must match run_UCJ.py's settings for this sweep.
 bond_distance = 2.00  # Angstrom; substituted by launch.sh from the subdirectory name.
-basis = "sto-3g"
 
-mol = pyscf.gto.M(
-    atom=f"N 0 0 0; N 0 0 {bond_distance}",
-    basis=basis,
-    verbose=0,
-)
-mf = pyscf.scf.RHF(mol)
+# Same pre-generated FCIDUMP that run_UCJ.py uses, so the Hamiltonians match.
+[fcidump_filename] = glob.glob("*_fcidump.txt")
+
+mf = pyscf.tools.fcidump.to_scf(fcidump_filename)
+mf.max_cycle = 100
+mf.conv_tol = 1e-9
+mf = mf.newton()
 mf.kernel()
 assert mf.converged, "SCF did not converge"
 
-# Extract second-quantized Hamiltonian parameters, in the HF molecular-orbital
-# basis (no active-space reduction here) -- same convention as run_UCJ.py.
-constant = mol.energy_nuc()
-h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
+# Extract second-quantized Hamiltonian parameters -- same convention as run_UCJ.py.
+constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
+h1e = mf.get_hcore()
 num_orb = h1e.shape[0]
-h2e = pyscf.ao2mo.restore(1, pyscf.ao2mo.kernel(mol, mf.mo_coeff), num_orb)
-nelec = mol.nelectron
+h2e = pyscf.ao2mo.restore(1, mf._eri, num_orb)
+nelec = pyscf.tools.fcidump.read(fcidump_filename)["NELEC"]
 nelec = (nelec // 2, nelec // 2)
 
 myci = selected_ci.SelectedCI()

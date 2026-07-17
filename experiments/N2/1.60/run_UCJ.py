@@ -7,11 +7,13 @@ subdirectory and replaces the placeholder bond distance below with that
 directory's value before running.
 """
 
+import glob
 import os
 import sys
 
 import numpy as np
 import pyscf
+import pyscf.tools.fcidump
 import ffsim
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
@@ -19,7 +21,6 @@ from fermiprop import UCJBackPropagator
 
 # Molecule / active space parameters.
 bond_distance = 1.60  # Angstrom; substituted by launch.sh from the subdirectory name.
-basis = "sto-3g"       # Full active space (no CAS/frozen-core reduction) -- adjust for a larger/smaller problem.
 
 # Parameters of the (L)UCJ ansatz.
 half_layer = False                       # If True, appends a final rotation to the circuit, but makes the energy worse.
@@ -27,19 +28,27 @@ alpha_alpha_indices = lambda norb: None  # Use lambda norb: [(p, p + 1) for p in
 alpha_beta_indices  = lambda norb: None  # Use lambda norb: [(p, p) for p in range(0, norb, 4) if p <= 16] for a (truncated) LUCJ circuit.
 
 # Variational optimization settings. See fermiprop/propagator.py's
-# optimize_jax() docstring: chunk_size must evenly divide num_orb**4;
-# num_orb**2 is always a safe, valid choice.
+# optimize_jax() docstring: chunk_size must evenly divide num_orb**4.
+# None (fully unchunked) needs ~48GB for this active space -- fine on an
+# H200 (143GB) but OOMs on a 32GB V100, and cluster jobs here can land on
+# either, so default to something that fits comfortably on the smallest
+# GPU in rotation. num_orb**3 (~26 chunks, ~1-2GB/chunk by linear
+# extrapolation from the 48GB/1-chunk figure) leaves plenty of headroom on
+# a 32GB card; drop to num_orb**2 (~676 chunks) if that's still too much,
+# or raise towards num_orb**4 (i.e. None) if you know you're on an H200.
 optimizer_method = "L-BFGS-B"
 optimizer_options = {"maxiter": 500, "gtol": 1e-9, "ftol": 1e-9}
-optimizer_chunk_size = None  # set below to num_orb**2 once num_orb is known
+optimizer_chunk_size = None  # set below to num_orb**3 once num_orb is known
 
-# Build the N2 molecule and run Hartree-Fock.
-mol = pyscf.gto.M(
-    atom=f"N 0 0 0; N 0 0 {bond_distance}",
-    basis=basis,
-    verbose=0,
-)   
-mf = pyscf.scf.RHF(mol)
+# Each bond-distance subdirectory has its own pre-generated FCIDUMP (active
+# space integrals for this R), matching the 4Fe-4S workflow.
+[fcidump_filename] = glob.glob("*_fcidump.txt")
+
+# Run Hartree-Fock.
+mf = pyscf.tools.fcidump.to_scf(fcidump_filename)
+mf.max_cycle = 100
+mf.conv_tol = 1e-9
+mf = mf.newton()
 mf.kernel()
 assert mf.converged, "SCF did not converge"
 
@@ -51,25 +60,26 @@ eccsd, *_ = ccsd.kernel()
 cisd = pyscf.ci.CISD(mf)
 ecisd, *_ = cisd.kernel()
 
-# Extract second-quantized Hamiltonian and Hamiltonian parameters, in the
-# HF molecular-orbital basis (no active-space reduction here).
-constant = mol.energy_nuc()
-h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
+# Extract second-quantized Hamiltonian and Hamiltonian parameters.
+constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
+h1e = mf.get_hcore()
 num_orb = h1e.shape[0]
 n_qubits = 2 * num_orb
-h2e = pyscf.ao2mo.restore(1, pyscf.ao2mo.kernel(mol, mf.mo_coeff), num_orb)
-nelec = mol.nelectron
-
-print(f"Bond distance: {bond_distance} Angstrom")
-print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
-print("Hartree-Fock energy:", mf.e_tot)
-print("CCSD correlation energy:", eccsd)
-print("CCSD total energy:", ccsd.e_tot)
-print("CISD correlation energy:", ecisd)
-print("CISD total energy:", cisd.e_tot)
+h2e = pyscf.ao2mo.restore(1, mf._eri, num_orb)
+nelec = pyscf.tools.fcidump.read(fcidump_filename)["NELEC"]
 
 if optimizer_chunk_size is None:
-    optimizer_chunk_size = num_orb ** 2
+    optimizer_chunk_size = num_orb ** 3
+
+print(f"Bond distance: {bond_distance} Angstrom")
+print(f"FCIDUMP: {fcidump_filename}")
+print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
+print(f"optimize_jax chunk_size: {optimizer_chunk_size}")
+# print("Hartree-Fock energy:", mf.e_tot)
+# print("CCSD correlation energy:", eccsd)
+# print("CCSD total energy:", ccsd.e_tot)
+# print("CISD correlation energy:", ecisd)
+# print("CISD total energy:", cisd.e_tot)
 
 nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
 
