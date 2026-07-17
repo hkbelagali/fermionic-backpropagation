@@ -108,6 +108,11 @@ for r in distances:
         dict(max_cycle=500, iterative_damping=0.3, level_shift=1.0),
         dict(max_cycle=500, iterative_damping=0.3, level_shift=2.0),
         dict(max_cycle=500, iterative_damping=0.1, level_shift=1.0),
+        # Found by grid search directly against R=3.00 (the remaining
+        # holdout after the stages above): delaying DIIS extrapolation
+        # (diis_start_cycle) combined with level_shift=1.0 finds the same
+        # ~-109.005 solution that plain level_shift=1.0 alone misses here.
+        dict(max_cycle=500, iterative_damping=1.0, level_shift=1.0, diis_start_cycle=4),
     ]
     ccsd = None
     for cfg in ccsd_configs:
