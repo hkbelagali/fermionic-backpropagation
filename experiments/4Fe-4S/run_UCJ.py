@@ -4,6 +4,7 @@ sulfur cluster UCJ circuit from [1] https://www.science.org/doi/10.1126/sciadv.a
 """
 
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -32,49 +33,85 @@ optimizer_options = {"maxiter": 50}
 optimizer_chunk_size = None  # set below to num_orb**2 once num_orb is known
 
 fcidump_filename = os.path.join(os.path.dirname(__file__), "fcidump_Fe4S4_MO.txt")
+ucj_op_path = os.path.join(os.path.dirname(__file__), "ucj_op.pkl")
 
-# Run Hartree-Fock.
-mf_as = pyscf.tools.fcidump.to_scf(fcidump_filename)
-mf_as.max_cycle = 100
-mf_as.conv_tol = 1e-9
-mf_as = mf_as.newton()
-mf_as.kernel()
-assert mf_as.converged, "SCF did not converge"
+if os.path.exists(ucj_op_path):
+    # HF, CCSD, and the CCSD-derived UCJ operator are expensive at this
+    # active-space size and are deterministic given the fcidump/ansatz
+    # settings above, so reuse them from disk if already computed.
+    print(f"Loading cached HF/CCSD/UCJ data from {ucj_op_path}")
+    with open(ucj_op_path, "rb") as f:
+        cached = pickle.load(f)
+    hf_energy = cached["hf_energy"]
+    ccsd_energy = cached["ccsd_energy"]
+    eccsd = cached["ccsd_corr_energy"]
+    h1e = cached["h1e"]
+    h2e = cached["h2e"]
+    num_orb = cached["num_orb"]
+    n_qubits = cached["n_qubits"]
+    nelec = cached["nelec"]
+    constant = cached["ecore"]
+    ucj_op = cached["ucj_op"]
+else:
+    # Run Hartree-Fock.
+    mf_as = pyscf.tools.fcidump.to_scf(fcidump_filename)
+    mf_as.max_cycle = 100
+    mf_as.conv_tol = 1e-9
+    mf_as = mf_as.newton()
+    mf_as.kernel()
+    assert mf_as.converged, "SCF did not converge"
 
-# Run CCSD.
-ccsd = pyscf.cc.CCSD(mf_as)
-eccsd, *_ = ccsd.kernel()
+    # Run CCSD.
+    ccsd = pyscf.cc.CCSD(mf_as)
+    eccsd, *_ = ccsd.kernel()
 
-# Extract second-quantized Hamiltonian and Hamiltonian parameters.
-constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
-h1e = mf_as.get_hcore()
-num_orb = h1e.shape[0]
-n_qubits = 2 * num_orb
-h2e = pyscf.ao2mo.restore(1, mf_as._eri, num_orb)
-nelec = pyscf.tools.fcidump.read(fcidump_filename)["NELEC"]
+    # Extract second-quantized Hamiltonian and Hamiltonian parameters.
+    constant = pyscf.tools.fcidump.read(fcidump_filename).get("ECORE", 0.0)
+    h1e = mf_as.get_hcore()
+    num_orb = h1e.shape[0]
+    n_qubits = 2 * num_orb
+    h2e = pyscf.ao2mo.restore(1, mf_as._eri, num_orb)
+    nelec = pyscf.tools.fcidump.read(fcidump_filename)["NELEC"]
+    nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
+
+    # Build the UCJ Operation.
+    base_op = ffsim.UCJOpSpinBalanced.from_t_amplitudes(
+        t2=ccsd.t2, n_reps=1,  # The polynomial time algorithm applies to one repetition/layer of the UCJ ansatz.
+        interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
+    )
+    if half_layer:
+        ucj_op = ffsim.UCJOpSpinBalanced(
+            diag_coulomb_mats=base_op.diag_coulomb_mats[:1],
+            orbital_rotations=base_op.orbital_rotations[:1],
+            final_orbital_rotation=base_op.orbital_rotations[1].conj().T,
+        )
+    else:
+        ucj_op = base_op
+
+    hf_energy = mf_as.e_tot
+    ccsd_energy = ccsd.e_tot
+
+    with open(ucj_op_path, "wb") as f:
+        pickle.dump({
+            "hf_energy": hf_energy,
+            "ccsd_energy": ccsd_energy,
+            "ccsd_corr_energy": eccsd,
+            "h1e": h1e,
+            "h2e": h2e,
+            "num_orb": num_orb,
+            "n_qubits": n_qubits,
+            "nelec": nelec,
+            "ecore": constant,
+            "ucj_op": ucj_op,
+        }, f)
+    print(f"Saved HF/CCSD/UCJ data to {ucj_op_path}")
 
 print(f"Number of spatial orbitals: {num_orb}, Number of qubits: {n_qubits}")
 print("CCSD correlation energy:", eccsd)
-print("CCSD total energy:", ccsd.e_tot)
+print("CCSD total energy:", ccsd_energy)
 
 if optimizer_chunk_size is None:
     optimizer_chunk_size = num_orb ** 2
-
-nelec = (nelec // 2, nelec // 2)  # Convert to (n_alpha, n_beta) tuple.
-
-# Build the UCJ Operation.
-base_op = ffsim.UCJOpSpinBalanced.from_t_amplitudes(
-    t2=ccsd.t2, n_reps=1,  # The polynomial time algorithm applies to one repetition/layer of the UCJ ansatz.
-    interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
-)
-if half_layer:
-    ucj_op = ffsim.UCJOpSpinBalanced(
-        diag_coulomb_mats=base_op.diag_coulomb_mats[:1],
-        orbital_rotations=base_op.orbital_rotations[:1],
-        final_orbital_rotation=base_op.orbital_rotations[1].conj().T,
-    )
-else:
-    ucj_op = base_op
 
 backprop = UCJBackPropagator(ucj_op, nelec=nelec, num_orb=num_orb, h1e=h1e, h2e=h2e, ecore=constant)
 
@@ -93,16 +130,16 @@ result = backprop.optimize_jax(
 )
 ucj_optimized_energy = backprop.propagate(show_progress=False)
 
-print(f"Hartree-Fock energy: {mf_as.e_tot:.10f} Ha")
-print(f"CCSD energy: {ccsd.e_tot:.10f} Ha")
+print(f"Hartree-Fock energy: {hf_energy:.10f} Ha")
+print(f"CCSD energy: {ccsd_energy:.10f} Ha")
 print(f"CCSD-parameterized UCJ energy: {ucj_ccsd_energy:.10f} Ha")
 print(f"Variationally optimized UCJ energy: {ucj_optimized_energy:.10f} Ha")
 
 out_path = os.path.join(os.path.dirname(__file__), "UCJ_results.npz")
 np.savez(
     out_path,
-    hf_energy=mf_as.e_tot,
-    ccsd_energy=ccsd.e_tot,
+    hf_energy=hf_energy,
+    ccsd_energy=ccsd_energy,
     ucj_ccsd_energy=ucj_ccsd_energy,
     ucj_optimized_energy=ucj_optimized_energy,
 )
