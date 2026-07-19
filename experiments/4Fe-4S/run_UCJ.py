@@ -83,11 +83,13 @@ ucj_ccsd_energy = backprop.propagate()
 
 # Variationally optimize the circuit parameters starting from the
 # CCSD-derived parameters, using analytic (JAX autodiff) gradients.
+checkpoint_path = os.path.join(os.path.dirname(__file__), "UCJ_checkpoint.npz")
 result = backprop.optimize_jax(
     interaction_pairs=(alpha_alpha_indices(num_orb), alpha_beta_indices(num_orb)),
     chunk_size=optimizer_chunk_size,
     method=optimizer_method,
     options=optimizer_options,
+    checkpoint_path=checkpoint_path,
 )
 ucj_optimized_energy = backprop.propagate(show_progress=False)
 

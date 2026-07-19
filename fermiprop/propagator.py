@@ -1,4 +1,6 @@
-"""Numerical backpropagator for the UCJ ansatz.""" 
+"""Numerical backpropagator for the UCJ ansatz."""
+
+import os
 
 import numpy as np
 import scipy.optimize
@@ -152,6 +154,8 @@ class UCJBackPropagator:
         interaction_pairs: tuple[list[tuple[int, int]] | None, list[tuple[int, int]] | None] | None = None,
         chunk_size: int | None = None,
         show_progress: bool = True,
+        checkpoint_path: str | os.PathLike | None = None,
+        checkpoint_interval: int = 1,
         **minimize_options,
     ) -> scipy.optimize.OptimizeResult:
         """
@@ -162,7 +166,8 @@ class UCJBackPropagator:
             x0: Initial guess for the circuit parameters, in the real-valued
                 parameterization produced by `UCJOpSpinBalanced.to_parameters`.
                 Defaults to the parameters of the operator this backpropagator
-                was constructed with.
+                was constructed with, unless `checkpoint_path` points to an
+                existing checkpoint, in which case the run resumes from there.
             interaction_pairs: Restrictions on allowed orbital interactions for
                 the diagonal Coulomb operators, forwarded to `to_parameters`/
                 `from_parameters`. Must match how `x0` was generated, if given.
@@ -176,6 +181,20 @@ class UCJBackPropagator:
                 in `**minimize_options`, it is called after the progress bar
                 updates on each step (it must accept scipy's modern
                 `callback(intermediate_result)` signature).
+            checkpoint_path: If given, periodically save the current
+                parameters/iteration/energy to this path (as an `.npz` file,
+                written atomically) so a long run can be resumed after being
+                interrupted. If the file already exists when this is called
+                and `x0` is not explicitly given, optimization resumes from
+                the checkpointed parameters instead of `self.op`'s parameters.
+                Note this checkpoints optimizer *progress* (parameters), not
+                L-BFGS-B's internal Hessian approximation state, which scipy
+                does not expose; resuming restarts that internal memory from
+                the checkpointed point. If `options["maxiter"]` is set, it is
+                reduced by the number of already-completed iterations on
+                resume.
+            checkpoint_interval: Save a checkpoint every this many optimizer
+                iterations. Only used if `checkpoint_path` is given.
             **minimize_options: Additional keyword arguments forwarded to
                 `scipy.optimize.minimize` (e.g. `method`, `options`, `tol`,
                 `bounds`, `callback`). `jac` is always set to `True` internally,
@@ -190,6 +209,16 @@ class UCJBackPropagator:
         n_reps, _, norb, _ = self.op.diag_coulomb_mats.shape
         with_final_orbital_rotation = self.op.final_orbital_rotation is not None
 
+        start_iter = 0
+        if x0 is None and checkpoint_path is not None and os.path.exists(checkpoint_path):
+            checkpoint = np.load(checkpoint_path)
+            x0 = checkpoint["x"]
+            start_iter = int(checkpoint["nit"])
+            print(f"optimize_jax: resuming from checkpoint {checkpoint_path} at iteration {start_iter}")
+            options = dict(minimize_options.get("options") or {})
+            if "maxiter" in options:
+                options["maxiter"] = max(options["maxiter"] - start_iter, 0)
+                minimize_options["options"] = options
         if x0 is None:
             x0 = self.op.to_parameters(interaction_pairs=interaction_pairs)
 
@@ -207,24 +236,38 @@ class UCJBackPropagator:
             energy, grad = value_and_grad_fn(jnp.array(params))
             return float(energy), np.asarray(grad)
 
+        def save_checkpoint(x: np.typing.NDArray, nit: int, energy: float) -> None:
+            tmp_path = f"{checkpoint_path}.tmp"
+            np.savez(tmp_path, x=x, nit=nit, energy=energy)
+            os.replace(tmp_path, checkpoint_path)
+
         user_callback = minimize_options.pop("callback", None)
         pbar = None
         if show_progress:
             maxiter = (minimize_options.get("options") or {}).get("maxiter")
-            pbar = tqdm(total=maxiter, desc="optimize_jax", unit="step")
+            total = None if maxiter is None else maxiter + start_iter
+            pbar = tqdm(total=total, initial=start_iter, desc="optimize_jax", unit="step")
 
-            def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+        iteration = start_iter
+
+        def callback(intermediate_result: scipy.optimize.OptimizeResult) -> None:
+            nonlocal iteration
+            iteration += 1
+            if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(energy=f"{intermediate_result.fun:.8f}")
-                if user_callback is not None:
-                    user_callback(intermediate_result)
+            if checkpoint_path is not None and iteration % checkpoint_interval == 0:
+                save_checkpoint(intermediate_result.x, iteration, float(intermediate_result.fun))
+            if user_callback is not None:
+                user_callback(intermediate_result)
 
+        if show_progress or checkpoint_path is not None or user_callback is not None:
             minimize_options["callback"] = callback
-        elif user_callback is not None:
-            minimize_options["callback"] = user_callback
 
         try:
             result = scipy.optimize.minimize(cost, x0, jac=True, **minimize_options)
+            if checkpoint_path is not None:
+                save_checkpoint(result.x, iteration, float(result.fun))
         finally:
             if pbar is not None:
                 pbar.close()
