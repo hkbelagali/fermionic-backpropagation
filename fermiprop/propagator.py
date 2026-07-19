@@ -237,8 +237,13 @@ class UCJBackPropagator:
             return float(energy), np.asarray(grad)
 
         def save_checkpoint(x: np.typing.NDArray, nit: int, energy: float) -> None:
+            # Write via an open file handle rather than a path string: np.savez
+            # silently appends ".npz" to string paths that don't already end in
+            # ".npz", which would otherwise write to "<tmp_path>.npz" instead of
+            # tmp_path and break the os.replace below.
             tmp_path = f"{checkpoint_path}.tmp"
-            np.savez(tmp_path, x=x, nit=nit, energy=energy)
+            with open(tmp_path, "wb") as f:
+                np.savez(f, x=x, nit=nit, energy=energy)
             os.replace(tmp_path, checkpoint_path)
 
         user_callback = minimize_options.pop("callback", None)
